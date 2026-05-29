@@ -15,24 +15,32 @@ enum HandleState {
 
 class SSHFSItem: FSItem {
     let id: FSItem.Identifier
-    let path: String
+    var path: String?
     let parent: FSItem.Identifier
+    var name: FSFileName
     
     var read = HandleState.closed
     var write = HandleState.closed
     var directoryCookies = Set<UInt64>()
     
-    init(parent: FSItem.Identifier, id: FSItem.Identifier, path: String) {
+    init(parent: FSItem.Identifier, id: FSItem.Identifier, path: String, name: FSFileName) {
         self.id = id
         self.parent = parent
         self.path = path
+        self.name = name
     }
     
-    func resolve(_ subpath: some StringProtocol) -> String {
+    func resolve(_ subpath: some StringProtocol) -> String? {
+        guard let path else {
+            return nil
+        }
+        
         if path.isEmpty {
-            String(subpath)
+            return String(subpath)
+        } else if path == "/" {
+            return path + subpath
         } else {
-            path + "/" + subpath
+            return path + "/" + subpath
         }
     }
 }

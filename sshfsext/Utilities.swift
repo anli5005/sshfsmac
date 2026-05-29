@@ -81,6 +81,18 @@ protocol SFTPClientMessage {
     func payload() -> Payload
 }
 
+protocol SFTPClientExtensionMessage: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var extensionName: String { get }
+    func extensionPayload() -> Data
+}
+
+extension SFTPClientExtensionMessage {
+    static var type: UInt8 { 200 }
+    func payload() -> Data {
+        id.bytes + Self.extensionName.data(using: .utf8)!.lengthEncoded + extensionPayload()
+    }
+}
+
 protocol SFTPIdentifiedPacket {
     var id: UInt32 { get }
 }
@@ -145,6 +157,19 @@ struct SFTPReadRequest: SFTPClientMessage, SFTPIdentifiedPacket {
     }
 }
 
+struct SFTPWriteRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 6 }
+    
+    let id: UInt32
+    let handle: Data
+    let offset: UInt64
+    let data: Data
+    
+    func payload() -> some DataProtocol {
+        id.bytes + handle.lengthEncoded + offset.bytes + data.lengthEncoded
+    }
+}
+
 struct SFTPLStatRequest: SFTPClientMessage, SFTPIdentifiedPacket {
     static var type: UInt8 { 7 }
     
@@ -153,6 +178,18 @@ struct SFTPLStatRequest: SFTPClientMessage, SFTPIdentifiedPacket {
     
     func payload() -> some DataProtocol {
         id.bytes + path.lengthEncoded
+    }
+}
+
+struct SFTPSetStatRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 9 }
+    
+    let id: UInt32
+    let path: Data
+    let attributes: SFTPAttributes
+    
+    func payload() -> some DataProtocol {
+        id.bytes + path.lengthEncoded + attributes.encode()
     }
 }
 
@@ -178,8 +215,31 @@ struct SFTPReadDirRequest: SFTPClientMessage, SFTPIdentifiedPacket {
     }
 }
 
-struct SFTPReadLinkRequest: SFTPClientMessage, SFTPIdentifiedPacket {
-    static var type: UInt8 { 19 }
+struct SFTPRemoveRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 13 }
+    
+    let id: UInt32
+    let path: Data
+    
+    func payload() -> some DataProtocol {
+        id.bytes + path.lengthEncoded
+    }
+}
+
+struct SFTPMkdirRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 14 }
+    
+    let id: UInt32
+    let path: Data
+    let attributes: SFTPAttributes
+    
+    func payload() -> some DataProtocol {
+        id.bytes + path.lengthEncoded + attributes.encode()
+    }
+}
+
+struct SFTPRmdirRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 15 }
     
     let id: UInt32
     let path: Data
@@ -197,6 +257,58 @@ struct SFTPRealPathRequest: SFTPClientMessage, SFTPIdentifiedPacket {
     
     func payload() -> some DataProtocol {
         id.bytes + path.lengthEncoded
+    }
+}
+
+struct SFTPReadLinkRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 19 }
+    
+    let id: UInt32
+    let path: Data
+    
+    func payload() -> some DataProtocol {
+        id.bytes + path.lengthEncoded
+    }
+}
+
+struct SFTPSymlinkRequest: SFTPClientMessage, SFTPIdentifiedPacket {
+    static var type: UInt8 { 19 }
+    
+    let id: UInt32
+    let linkPath: Data
+    let targetPath: Data
+    let useOpenSSHQuirks: Bool
+    
+    func payload() -> some DataProtocol {
+        if useOpenSSHQuirks {
+            return id.bytes + targetPath.lengthEncoded + linkPath.lengthEncoded
+        } else {
+            return id.bytes + linkPath.lengthEncoded + targetPath.lengthEncoded
+        }
+    }
+}
+
+struct SFTPPOSIXRenameRequest: SFTPClientExtensionMessage {
+    static var extensionName: String { "posix-rename@openssh.com" }
+    let id: UInt32
+    
+    let oldPath: Data
+    let newPath: Data
+    
+    func extensionPayload() -> Data {
+        oldPath.lengthEncoded + newPath.lengthEncoded
+    }
+}
+
+struct SFTPHardLinkRequest: SFTPClientExtensionMessage {
+    static var extensionName: String { "hardlink@openssh.com" }
+    let id: UInt32
+    
+    let existingPath: Data
+    let newPath: Data
+    
+    func extensionPayload() -> Data {
+        existingPath.lengthEncoded + newPath.lengthEncoded
     }
 }
 
@@ -315,8 +427,11 @@ struct SFTPAttributes {
         static let extended = Flags(rawValue: 0x80000000)
     }
     
+    var isEmpty: Bool {
+        size == nil && ownership == nil && permissions == nil && times == nil
+    }
+    
     func encode() -> Data {
-        let flagSize = MemoryLayout<Flags.RawValue>.size
         var buffer = Data()
         
         var flags = Flags(rawValue: 0)
@@ -408,50 +523,72 @@ extension SFTPAttributes {
         }
     }
     
-    func toFSKitAttributes(request: FSItem.GetAttributesRequest, identifier: FSItem.Identifier, parent: FSItem.Identifier) -> FSItem.Attributes {
+    mutating func apply(request: FSItem.SetAttributesRequest) {
+        if request.isValid(.size) {
+            size = request.size
+            request.consumedAttributes.insert(.size)
+        }
+        
+        if request.isValid(.mode) {
+            permissions = request.mode
+            request.consumedAttributes.insert(.mode)
+        }
+        
+        if request.isValid(.uid), request.isValid(.gid) {
+            ownership = (uid: request.uid, gid: request.gid)
+            request.consumedAttributes.formUnion([.uid, .gid])
+        }
+        
+        if request.isValid(.accessTime), request.isValid(.modifyTime) {
+            times = (a: UInt32(request.accessTime.tv_sec), m: UInt32(request.modifyTime.tv_sec))
+            request.consumedAttributes.formUnion([.accessTime, .modifyTime])
+        }
+    }
+    
+    func toFSKitAttributes(request: FSItem.GetAttributesRequest?, identifier: FSItem.Identifier, parent: FSItem.Identifier) -> FSItem.Attributes {
         let attributes = FSItem.Attributes()
         
-        if request.isAttributeWanted(.type) {
+        if request?.isAttributeWanted(.type) != false {
             attributes.type = type
         }
         
-        if request.isAttributeWanted(.mode) {
+        if request?.isAttributeWanted(.mode) != false {
             attributes.mode = permissions ?? UInt32(S_IFREG | 0o777)
         }
         
-        if request.isAttributeWanted(.size) {
+        if request?.isAttributeWanted(.size) != false {
             attributes.size = size ?? 0
         }
         
-        if request.isAttributeWanted(.fileID) {
+        if request?.isAttributeWanted(.fileID) != false {
             attributes.fileID = identifier
         }
         
-        if request.isAttributeWanted(.parentID) {
+        if request?.isAttributeWanted(.parentID) != false {
             attributes.parentID = parent
         }
         
-        if request.isAttributeWanted(.flags) {
+        if request?.isAttributeWanted(.flags) != false {
             attributes.flags = 0
         }
         
         let times = times ?? (0, 0)
                 
-        if request.isAttributeWanted(.accessTime) {
+        if request?.isAttributeWanted(.accessTime) != false {
             attributes.accessTime = timespec(tv_sec: time_t(times.a), tv_nsec: 0)
         }
         
-        if request.isAttributeWanted(.modifyTime) {
+        if request?.isAttributeWanted(.modifyTime) != false {
             attributes.modifyTime = timespec(tv_sec: time_t(times.m), tv_nsec: 0)
         }
         
         let ownership = ownership ?? (0, 0)
         
-        if request.isAttributeWanted(.uid) {
+        if request?.isAttributeWanted(.uid) != false {
             attributes.uid = ownership.uid
         }
         
-        if request.isAttributeWanted(.gid) {
+        if request?.isAttributeWanted(.gid) != false {
             attributes.gid = ownership.gid
         }
         

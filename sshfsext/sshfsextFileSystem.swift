@@ -88,7 +88,13 @@ class sshfsextFileSystem : FSUnaryFileSystem & FSUnaryFileSystemOperations {
                     path.removeLast()
                 }
                 
-                return try SSHFSVolume(identifier: FSVolume.Identifier(uuid: UUID()), name: FSFileName(string: resource.url.host(percentEncoded: false) ?? "SSH Filesystem"), socket: handle, base: path, extensions: extensions)
+                let volume = try SSHFSVolume(identifier: FSVolume.Identifier(uuid: UUID()), name: FSFileName(string: resource.url.host(percentEncoded: false) ?? "SSH Filesystem"), socket: handle, base: path, extensions: extensions)
+                
+                if options.taskOptions.contains(["-o", "xattrfallback"]) {
+                    volume.xattrOperationsInhibited = true
+                }
+                
+                return volume
             } catch {
                 try handle.close()
                 throw error
